@@ -1,3 +1,5 @@
+import { isArrayOnBook, type SeisArray } from '@/types/array';
+
 /** 仪器类型 */
 export type InstrumentType = '宽频带' | '短周期' | '强震';
 
@@ -10,7 +12,6 @@ export const INSTRUMENT_STATES: InstrumentState[] = ['在用', '待标定', '已
 
 /** 标定周期（天）：超过该天数未标定即视为超期 */
 export const CALIBRATION_CYCLE_DAYS = 365;
-
 /** 仪器：安装于台站的观测设备 */
 export interface Instrument {
   id: string;
@@ -63,11 +64,29 @@ export const COMMON_MODELS: Record<InstrumentType, string[]> = {
 };
 
 /**
- * 计算距下次标定的天数：正数表示剩余天数，负数表示已超期天数。
- * 以最近一次标定日期（无标定则用安装日期）为基准。
+ * 标定周期起算日：台阵在账（运行中且有投运日期）才进入周期。
+ * 投运日晚于安装日的（建设期预装仪器），从投运日起算；投运后新装的从安装日起算。
+ * 返回 null 表示未在账：不进在账台数、不进超期名单与按期标定率。
  */
-export function daysUntilDue(lastCalibrationDate: string | null, installDate: string): number {
-  const base = lastCalibrationDate ?? installDate;
+export function cycleBaseDate(
+  installDate: string,
+  array: Pick<SeisArray, 'state' | 'commissionDate'> | null | undefined
+): string | null {
+  if (!isArrayOnBook(array)) return null;
+  const commission = array?.commissionDate ?? '';
+  return commission > installDate ? commission : installDate;
+}
+
+/**
+ * 计算距下次标定的天数：正数表示剩余天数，负数表示已超期天数。
+ * 基准取最近一次标定日期；无标定时取周期起算日（未传则回退安装日期）。
+ */
+export function daysUntilDue(
+  lastCalibrationDate: string | null,
+  installDate: string,
+  cycleBase?: string | null
+): number {
+  const base = lastCalibrationDate ?? cycleBase ?? installDate;
   const baseTime = Date.parse(`${base}T00:00:00`);
   if (!Number.isFinite(baseTime)) return CALIBRATION_CYCLE_DAYS;
   const dueTime = baseTime + CALIBRATION_CYCLE_DAYS * 86400000;

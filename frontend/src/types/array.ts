@@ -12,14 +12,56 @@ export interface SeisArray {
   apertureKm: number;
   /** 台站数（由台站表汇总回写） */
   stationCount: number;
-  /** 布设日期 */
+  /** 布设日期（布设班组维护） */
   deployDate: string;
-  /** 运行状态 */
+  /** 运行状态（台网中心维护） */
   state: ArrayState;
+  /**
+   * 投运日期（台网中心维护，YYYY-MM-DD，空串表示尚未投运）。
+   * 台阵转「运行中」且投运日期齐备后，旗下仪器才进在账台数与标定周期。
+   */
+  commissionDate: string;
   /** 管理部门 */
   department: string;
   createdAt: number;
   updatedAt: number;
+}
+
+/**
+ * 在账口径：台阵「运行中」且台网中心已下发投运日期。
+ * 未在账台阵的仪器不进在账台数、不进标定周期（超期名单与按期标定率同口径）。
+ */
+export function isArrayOnBook(
+  array: Pick<SeisArray, 'state' | 'commissionDate'> | null | undefined
+): boolean {
+  return (
+    !!array &&
+    array.state === '运行中' &&
+    typeof array.commissionDate === 'string' &&
+    array.commissionDate.length > 0
+  );
+}
+
+/**
+ * 升级 / 导入旧数据时按安装日期回填投运日期：
+ * - 运行中 / 停测的台阵取旗下仪器最早安装日期；
+ * - 建设中的台阵尚未投运，留空；
+ * - 无仪器可参照的留空（补不出，由对账面板单列，待台网中心补登）。
+ */
+export function deriveCommissionDate(
+  array: Pick<SeisArray, 'id' | 'state'>,
+  stations: Array<{ id: string; arrayId: string }>,
+  instruments: Array<{ stationId: string; installDate: string }>
+): string {
+  if (array.state === '建设中') return '';
+  const stationIds = new Set(
+    stations.filter((station) => station.arrayId === array.id).map((station) => station.id)
+  );
+  const installDates = instruments
+    .filter((instrument) => stationIds.has(instrument.stationId) && instrument.installDate)
+    .map((instrument) => instrument.installDate)
+    .sort();
+  return installDates[0] ?? '';
 }
 
 /** 台阵台账筛选条件（存于 arraySlice，并同步 URL query） */

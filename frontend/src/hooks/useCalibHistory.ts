@@ -8,7 +8,7 @@ import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
 import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
-import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
+import { CALIBRATION_CYCLE_DAYS, cycleBaseDate, daysUntilDue } from '@/types/instrument';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
 import type { Instrument } from '@/types/instrument';
 
@@ -18,6 +18,10 @@ export interface InstrumentCalibHistory {
   stationCode: string;
   arrayId: string;
   arrayName: string;
+  /** 是否在账（台阵运行中且投运日期齐备）；未在账不进超期名单与按期标定率 */
+  onBook: boolean;
+  /** 标定周期起算日（安装日与投运日取晚者；未在账为 null） */
+  cycleBase: string | null;
   /** 历次标定（按日期降序） */
   calibrations: Calibration[];
   /** 最近一次标定 */
@@ -26,9 +30,9 @@ export interface InstrumentCalibHistory {
   delta: SensitivityDelta;
   /** 标定次数 */
   count: number;
-  /** 距下次标定天数（负数为已超期） */
+  /** 距下次标定天数（负数为已超期）；未在账仪器不判定超期 */
   dueInDays: number;
-  /** 是否超期未标定 */
+  /** 是否超期未标定（仅在账仪器参与判定） */
   overdue: boolean;
   /** 是否处于待标定状态 */
   pending: boolean;
@@ -62,13 +66,15 @@ export function useCalibHistory(): UseCalibHistoryResult {
       .map((instrument) => {
         const station = stations.find((item) => item.id === instrument.stationId);
         const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
+        const cycleBase = cycleBaseDate(instrument.installDate, array);
+        const onBook = cycleBase !== null;
         const rows = calibrations
           .filter((calibration) => calibration.instrumentId === instrument.id)
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = rows.length > 0 ? rows[0] : null;
         const previous = rows.length > 1 ? rows[1] : null;
         const delta = sensitivityDelta(latest?.sensitivity ?? 0, previous ? previous.sensitivity : null);
-        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
+        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate, cycleBase);
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
           return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
         }, '合格');
@@ -77,13 +83,15 @@ export function useCalibHistory(): UseCalibHistoryResult {
           stationCode: station?.code ?? '未知台站',
           arrayId: array?.id ?? station?.arrayId ?? '',
           arrayName: array?.name ?? '未知台阵',
+          onBook,
+          cycleBase,
           calibrations: rows,
           latest,
           delta,
           count: rows.length,
           dueInDays,
-          overdue: dueInDays < 0,
-          pending: instrument.state === '待标定' || dueInDays < 0,
+          overdue: onBook && dueInDays < 0,
+          pending: onBook && (instrument.state === '待标定' || dueInDays < 0),
           worstVerdict,
           trend: [...rows]
             .reverse()

@@ -30,6 +30,7 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import { isArrayOnBook } from '@/types/array';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -83,6 +84,12 @@ export default function App() {
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
   const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  // 在账仪器：所属台阵运行中且有投运日期（与超期名单、按期标定率同一口径）
+  const onBookInstruments = instruments.filter((instrument) => {
+    const station = stations.find((row) => row.id === instrument.stationId);
+    const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
+    return isArrayOnBook(array);
+  }).length;
 
   return (
     <>
@@ -127,7 +134,7 @@ export default function App() {
                 <AppstoreOutlined /> 台阵 {arrays.length} · 台站 {stations.length}
               </span>
               <span>
-                <ExperimentOutlined /> 仪器 {instruments.length}
+                <ExperimentOutlined /> 仪器 {instruments.length} · 在账 {onBookInstruments}
               </span>
               <span>
                 <ThunderboltOutlined /> 标定 {calibrations.length} · 不合格 {unqualified}
@@ -163,6 +170,9 @@ export default function App() {
                   <Tag>孔径 {currentArray.apertureKm} km</Tag>
                   <Tag color={currentArray.state === '运行中' ? 'green' : 'orange'}>{currentArray.state}</Tag>
                   <Tag>布设 {currentArray.deployDate}</Tag>
+                  <Tag color={isArrayOnBook(currentArray) ? 'green' : 'default'}>
+                    {currentArray.commissionDate ? `投运 ${currentArray.commissionDate}` : '未投运'}
+                  </Tag>
                 </>
               ) : (
                 <Tag>未选择台阵</Tag>

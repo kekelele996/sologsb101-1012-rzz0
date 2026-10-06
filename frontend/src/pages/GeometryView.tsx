@@ -233,7 +233,7 @@ export default function GeometryView() {
     const text = summaries
       .map(
         (row) =>
-          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
+          `${row.arrayName}（${row.state} / ${row.department}，投运 ${row.commissionDate || '未投运'}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台（在账 ${row.onBookInstrumentCount} 台），登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
       )
       .join('\n');
     try {
@@ -359,8 +359,15 @@ export default function GeometryView() {
                 </Descriptions.Item>
                 <Descriptions.Item label="管理部门">{activeSummary.department || '未填写'}</Descriptions.Item>
                 <Descriptions.Item label="布设日期">{activeSummary.deployDate}</Descriptions.Item>
+                <Descriptions.Item label="投运日期">
+                  {activeSummary.commissionDate || '未投运'}
+                  {!activeSummary.onBook ? (
+                    <span className="gb-hint">（仪器暂不进在账与标定周期）</span>
+                  ) : null}
+                </Descriptions.Item>
                 <Descriptions.Item label="台站数 / 仪器数">
                   {activeSummary.stationCount} / {activeSummary.instrumentCount}
+                  {activeSummary.onBook ? `（在账 ${activeSummary.onBookInstrumentCount} 台）` : ''}
                 </Descriptions.Item>
                 <Descriptions.Item label="登记 / 实算孔径">
                   {activeSummary.recordedApertureKm} km / <b>{activeSummary.computedApertureKm} km</b>
@@ -426,6 +433,13 @@ export default function GeometryView() {
           columns={[
             { title: '台阵', dataIndex: 'arrayName', width: 180 },
             { title: '状态', dataIndex: 'state', width: 90, render: (value: string) => <Tag>{value}</Tag> },
+            {
+              title: '投运日期',
+              dataIndex: 'commissionDate',
+              width: 110,
+              className: 'gb-mono',
+              render: (value: string) => value || <span className="gb-hint">未投运</span>,
+            },
             { title: '台站 / 仪器', width: 120, align: 'right', render: (_: unknown, row) => (
               <span className="gb-mono">{row.stationCount} / {row.instrumentCount}</span>
             ) },

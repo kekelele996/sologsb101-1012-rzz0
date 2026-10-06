@@ -5,7 +5,7 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { db, createId, watchTable } from '@/utils/db';
 import type { Instrument, InstrumentDraft, InstrumentState, InstrumentType } from '@/types/instrument';
-import { createEmptyInstrumentDraft, daysUntilDue } from '@/types/instrument';
+import { createEmptyInstrumentDraft, cycleBaseDate, daysUntilDue } from '@/types/instrument';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -54,9 +54,12 @@ export const createInstrument = createAsyncThunk(
     const now = Date.now();
     const row: Instrument = { ...payload, id: createId('ins'), createdAt: now, updatedAt: now };
     await db.instruments.put(row);
-    // 登记后自动生成下一次标定待办：待标定状态 + 提示文案
-    const dueInDays = daysUntilDue(null, row.installDate);
-    return { row, dueInDays };
+    // 登记后自动生成下一次标定待办：仅在账台阵（运行中且有投运日期）进周期
+    const station = await db.stations.get(row.stationId);
+    const array = station ? await db.arrays.get(station.arrayId) : undefined;
+    const cycleBase = cycleBaseDate(row.installDate, array ?? null);
+    const dueInDays = daysUntilDue(null, row.installDate, cycleBase);
+    return { row, dueInDays, onBook: cycleBase !== null };
   }
 );
 
@@ -148,11 +151,12 @@ const instrumentSlice = createSlice({
   extraReducers: (builder) => {
     builder
       .addCase(createInstrument.fulfilled, (state, action) => {
-        const dueInDays = action.payload.dueInDays;
-        state.lastReceipt =
-          dueInDays >= 0
+        const { dueInDays, onBook } = action.payload;
+        state.lastReceipt = !onBook
+          ? '仪器已登记；台阵尚未投运，暂不进在账与标定周期，投运后自投运日起算'
+          : dueInDays >= 0
             ? `仪器已登记，距下次标定 ${dueInDays} 天，请按期安排标定`
-            : `仪器已登记，但安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`;
+            : `仪器已登记，但周期起算日距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`;
         state.error = null;
       })
       .addCase(createInstrument.rejected, (state, action) => {

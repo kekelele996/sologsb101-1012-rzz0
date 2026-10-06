@@ -47,7 +47,7 @@ import {
 } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
-import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
+import { APERTURE_BUCKETS, ARRAY_STATES, isArrayOnBook, type ArrayState, type SeisArray } from '@/types/array';
 import { apertureKm, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -56,6 +56,7 @@ interface ArrayFormValues {
   apertureKm: number;
   deployDate: dayjs.Dayjs | null;
   state: ArrayState;
+  commissionDate: dayjs.Dayjs | null;
   department: string;
 }
 
@@ -121,10 +122,11 @@ export default function ArrayList() {
     });
   }, [arrays, filter]);
 
-  /** 台阵卡片统计：台站数、仪器数、标定数、不合格数与实算孔径 */
+  /** 台阵卡片统计：台站数、仪器数、在账台数、标定数、不合格数与实算孔径 */
   const cards = useMemo(
     () =>
       filtered.map((row) => {
+        const onBook = isArrayOnBook(row);
         const arrayStations = stations.filter((station) => station.arrayId === row.id);
         const stationIds = new Set(arrayStations.map((station) => station.id));
         const arrayInstruments = instruments.filter((instrument) => stationIds.has(instrument.stationId));
@@ -148,8 +150,10 @@ export default function ArrayList() {
         );
         return {
           row,
+          onBook,
           stationCount: arrayStations.length,
           instrumentCount: arrayInstruments.length,
+          onBookInstrumentCount: onBook ? arrayInstruments.length : 0,
           calibrationCount: arrayCalibrations.length,
           unqualified,
           pendingReplace,
@@ -217,6 +221,7 @@ export default function ArrayList() {
       apertureKm: 20,
       deployDate: dayjs(),
       state: '建设中',
+      commissionDate: null,
       department: '',
     });
     setModalOpen(true);
@@ -229,6 +234,7 @@ export default function ArrayList() {
       apertureKm: row.apertureKm,
       deployDate: dayjs(row.deployDate),
       state: row.state,
+      commissionDate: row.commissionDate ? dayjs(row.commissionDate) : null,
       department: row.department,
     });
     setModalOpen(true);
@@ -243,6 +249,8 @@ export default function ArrayList() {
         apertureKm: Number(values.apertureKm),
         deployDate: values.deployDate ? values.deployDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
         state: values.state,
+        // 投运日期由台网中心下发；非运行中允许留空（未投运）
+        commissionDate: values.commissionDate ? values.commissionDate.format('YYYY-MM-DD') : '',
         department: values.department?.trim() ?? '',
       };
       if (editingId) {
@@ -287,7 +295,7 @@ export default function ArrayList() {
             台阵与台站台账
           </Typography.Title>
           <p className="gb-hint">
-            维护台阵孔径、布设日期与运行状态，台站数与实算孔径自动汇总回显。点击「台站仪器」进入子页面。
+            维护台阵孔径、布设日期与运行状态；投运日期由台网中心下发，台阵转「运行中」且有投运日期后旗下仪器才进在账与标定周期。点击「台站仪器」进入子页面。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
@@ -384,6 +392,14 @@ export default function ArrayList() {
                   <StatBadge label="台站" value={card.stationCount} suffix="个" size="small" tone="info" />
                   <StatBadge label="仪器" value={card.instrumentCount} suffix="台" size="small" />
                   <StatBadge
+                    label="在账"
+                    value={card.onBookInstrumentCount}
+                    suffix="台"
+                    size="small"
+                    tone={card.onBook ? 'primary' : 'default'}
+                    tip={card.onBook ? '台阵运行中，仪器已进在账与标定周期' : '台阵未投运，仪器暂不进在账与周期'}
+                  />
+                  <StatBadge
                     label="标定合格率"
                     value={card.qualifyRate}
                     percent={card.qualifyRate}
@@ -395,6 +411,12 @@ export default function ArrayList() {
                   <span>
                     登记孔径 <b className="gb-mono">{card.row.apertureKm}</b> km · 实算孔径{' '}
                     <b className="gb-mono">{card.computedApertureKm}</b> km
+                  </span>
+                  <span>
+                    投运日期：{card.row.commissionDate ? <b className="gb-mono">{card.row.commissionDate}</b> : '未投运'}
+                    {!card.row.commissionDate && card.row.state !== '建设中' ? (
+                      <span className="gb-danger">（缺投运日期，待台网中心补登）</span>
+                    ) : null}
                   </span>
                   <span>
                     累计标定 <b className="gb-mono">{card.calibrationCount}</b> 次
@@ -452,6 +474,13 @@ export default function ArrayList() {
             { title: '孔径 (km)', dataIndex: 'apertureKm', width: 110, align: 'right', className: 'gb-mono' },
             { title: '台站数', dataIndex: 'stationCount', width: 90, align: 'right', className: 'gb-mono' },
             { title: '布设日期', dataIndex: 'deployDate', width: 120, className: 'gb-mono' },
+            {
+              title: '投运日期',
+              dataIndex: 'commissionDate',
+              width: 120,
+              className: 'gb-mono',
+              render: (value: string) => value || <span className="gb-hint">未投运</span>,
+            },
             { title: '管理部门', dataIndex: 'department', ellipsis: true },
             {
               title: '操作',
@@ -512,8 +541,23 @@ export default function ArrayList() {
               </Form.Item>
             </Col>
           </Row>
-          <Form.Item name="state" label="运行状态" rules={[{ required: true }]}>
+          <Form.Item name="state" label="运行状态（台网中心维护）" rules={[{ required: true }]}>
             <Select options={ARRAY_STATES.map((state) => ({ label: state, value: state }))} />
+          </Form.Item>
+          <Form.Item noStyle shouldUpdate={(prev, next) => prev.state !== next.state}>
+            {({ getFieldValue }) => {
+              const operational = getFieldValue('state') === '运行中';
+              return (
+                <Form.Item
+                  name="commissionDate"
+                  label="投运日期（台网中心下发）"
+                  rules={[{ required: operational, message: '运行中的台阵需填写投运日期，仪器自此进在账与标定周期' }]}
+                  extra={operational ? '仪器自安装日与投运日的较晚者起算标定周期' : '非运行中可留空；转运行中后由台网中心补登'}
+                >
+                  <DatePicker style={{ width: '100%' }} allowClear />
+                </Form.Item>
+              );
+            }}
           </Form.Item>
           <Form.Item name="department" label="管理部门">
             <Input placeholder="如：省地震局监测中心" maxLength={40} />

@@ -11,6 +11,8 @@ import {
   stampBackupTime,
   type BackupPayload,
 } from '@/utils/db';
+import { deriveCommissionDate, isArrayOnBook } from '@/types/array';
+import { cycleBaseDate, daysUntilDue } from '@/types/instrument';
 import type { ResponseVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
@@ -59,13 +61,21 @@ export function validateBackup(input: unknown): {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
+  const stations = obj.stations ?? [];
+  const instruments = obj.instruments ?? [];
+  // 旧版备份没有投运日期：与库迁移同一口径，按旗下仪器最早安装日期回填，补不出的留空（对账单列）
+  const arrays = (obj.arrays ?? []).map((row) =>
+    typeof row.commissionDate === 'string'
+      ? row
+      : { ...row, commissionDate: deriveCommissionDate(row, stations, instruments) }
+  );
   const payload: BackupPayload = {
     app: 'gbseisarray',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
-    arrays: obj.arrays ?? [],
-    stations: obj.stations ?? [],
-    instruments: obj.instruments ?? [],
+    arrays,
+    stations,
+    instruments,
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
   };
@@ -170,12 +180,18 @@ export interface ArrayGeometrySummary {
   state: string;
   department: string;
   deployDate: string;
+  /** 投运日期（空串 = 未投运） */
+  commissionDate: string;
+  /** 是否在账（运行中且投运日期齐备） */
+  onBook: boolean;
   /** 数据库登记的孔径 */
   recordedApertureKm: number;
   /** 由经纬度实算的孔径（最大台间距） */
   computedApertureKm: number;
   stationCount: number;
   instrumentCount: number;
+  /** 在账仪器台数（未在账台阵为 0） */
+  onBookInstrumentCount: number;
   /** 几何中心 */
   center: { lat: number; lng: number } | null;
   /** 最大台间距的两端台站码与方位角 */
@@ -193,8 +209,8 @@ export interface ArrayGeometrySummary {
 
 /** 由快照计算台阵几何与标定结论（供 /geometry 页展示） */
 export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummary[] {
-  const today = Date.now();
   return payload.arrays.map((array) => {
+    const onBook = isArrayOnBook(array);
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
     const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
@@ -222,15 +238,17 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     const unqualifiedCount = calibrations.filter(
       (calibration) => calibration.responseVerdict === '不合格'
     ).length;
-    const overdueCount = instruments.filter((instrument) => {
-      const rows = calibrations
-        .filter((calibration) => calibration.instrumentId === instrument.id)
-        .sort((a, b) => b.date.localeCompare(a.date));
-      const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;
-      const lastTime = Date.parse(`${lastDate}T00:00:00`);
-      if (!Number.isFinite(lastTime)) return true;
-      return today - lastTime > 365 * 86400000;
-    }).length;
+    // 超期口径与更换提醒页一致：仅在账仪器进周期，无标定时自周期起算日（安装日与投运日取晚者）起算
+    const overdueCount = onBook
+      ? instruments.filter((instrument) => {
+          const rows = calibrations
+            .filter((calibration) => calibration.instrumentId === instrument.id)
+            .sort((a, b) => b.date.localeCompare(a.date));
+          const lastDate = rows.length > 0 ? rows[0].date : null;
+          const cycleBase = cycleBaseDate(instrument.installDate, array);
+          return daysUntilDue(lastDate, instrument.installDate, cycleBase) < 0;
+        }).length
+      : 0;
     const pendingReplaceCount = replaces.filter((replace) => replace.state !== '已复核').length;
 
     const conclusionParts: string[] = [
@@ -238,6 +256,9 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       `实算孔径 ${computed} km`,
       `累计 ${calibrations.length} 次标定`,
     ];
+    if (!onBook) {
+      conclusionParts.push(array.state === '运行中' ? '缺投运日期，仪器暂未在账' : '未投运，仪器暂不进在账与标定周期');
+    }
     if (unqualifiedCount > 0) conclusionParts.push(`${unqualifiedCount} 次标定不合格`);
     if (overdueCount > 0) conclusionParts.push(`${overdueCount} 台超期未标定`);
     if (pendingReplaceCount > 0) conclusionParts.push(`${pendingReplaceCount} 条更换未闭环`);
@@ -248,10 +269,13 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       state: array.state,
       department: array.department,
       deployDate: array.deployDate,
+      commissionDate: array.commissionDate ?? '',
+      onBook,
       recordedApertureKm: array.apertureKm,
       computedApertureKm: computed,
       stationCount: stations.length,
       instrumentCount: instruments.length,
+      onBookInstrumentCount: onBook ? instruments.length : 0,
       center,
       maxPair:
         distances.length === 0

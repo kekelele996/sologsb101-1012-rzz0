@@ -1,6 +1,8 @@
 /**
  * 模块 4：/replacements 合格评定与更换提醒
  * 超期未标定仪器高亮、按标定结论登记更换并跟踪状态机到复核闭环。
+ * 在账口径：台阵运行中且有投运日期的仪器才进超期名单与按期标定率（同一口径）；
+ * 布设班组侧与台网中心侧按台站码对账，对不上的单列，重试只重读布设班组侧。
  * 复用 <StatBadge>、<QualifyTag>。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -23,7 +25,7 @@ import {
   Tag,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, WarningFilled } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, WarningFilled } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
@@ -52,8 +54,9 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
+import { cycleBaseDate, daysUntilDue, type Instrument } from '@/types/instrument';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
+import { reconcileByStationCode, reloadDeploymentSide, type ReconcileResult } from '@/utils/reconcile';
 import { initDatabase } from '@/utils/db';
 
 interface ReplaceFormValues {
@@ -72,6 +75,8 @@ interface AssessmentRow {
   stationCode: string;
   arrayId: string;
   arrayName: string;
+  /** 周期起算日（安装日与投运日取晚者） */
+  cycleBase: string;
   lastDate: string;
   dueInDays: number;
   overdue: boolean;
@@ -96,24 +101,33 @@ export default function ReplaceBoard() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [form] = Form.useForm<ReplaceFormValues>();
 
   useEffect(() => {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 在账对账：布设班组侧台站 × 台网中心侧台阵状态与投运日期，按台站码逐站核对 */
+  const reconcile = useMemo<ReconcileResult>(
+    () => reconcileByStationCode(stations, arrays, instruments),
+    [arrays, instruments, stations]
+  );
+
+  /** 仪器评定行：仅在账仪器（台阵运行中且有投运日期）进超期名单与按期标定率 */
   const rows = useMemo<AssessmentRow[]>(() => {
     return instruments
-      .map((instrument) => {
+      .map((instrument): AssessmentRow | null => {
         const station = stations.find((row) => row.id === instrument.stationId);
         const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
+        const cycleBase = cycleBaseDate(instrument.installDate, array);
+        if (cycleBase === null) return null;
         const own = calibrations
           .filter((row) => row.instrumentId === instrument.id)
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = own[0];
-        const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
+        const lastDate = latest ? latest.date : cycleBase;
+        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate, cycleBase);
         const replace =
           replaces
             .filter((row) => row.instrumentId === instrument.id)
@@ -123,6 +137,7 @@ export default function ReplaceBoard() {
           stationCode: station?.code ?? '未知台站',
           arrayId: array?.id ?? '',
           arrayName: array?.name ?? '未知台阵',
+          cycleBase,
           lastDate,
           dueInDays,
           overdue: dueInDays < 0,
@@ -131,6 +146,7 @@ export default function ReplaceBoard() {
           replace,
         };
       })
+      .filter((row): row is AssessmentRow => row !== null)
       .filter((row) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
@@ -152,10 +168,30 @@ export default function ReplaceBoard() {
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
+    // 按期标定率与超期名单同一口径：都只统计在账仪器
     const cycleRate =
       rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
-  }, [replaces, rows]);
+    const offBook = reconcile.unmatched.reduce((sum, row) => sum + row.instrumentCount, 0);
+    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate, offBook };
+  }, [reconcile.unmatched, replaces, rows]);
+
+  /** 重试对账：只重读布设班组侧（台站 / 仪器），台网中心下发的投运日期不回退 */
+  const handleRetryReconcile = async () => {
+    setRetrying(true);
+    try {
+      const deployment = await reloadDeploymentSide();
+      const next = reconcileByStationCode(deployment.stations, arrays, deployment.instruments);
+      if (next.unmatched.length === 0) {
+        message.success(`重试完成：${next.matched.length} 个台站全部对上，已进在账`);
+      } else {
+        message.warning(
+          `重试完成：仍有 ${next.unmatched.length} 个台站对不上（已单列）；台网中心下发的投运日期不回退，请核对布设侧台账或待台网中心补登`
+        );
+      }
+    } finally {
+      setRetrying(false);
+    }
+  };
 
   const replaceRows = useMemo(
     () =>
@@ -267,7 +303,8 @@ export default function ReplaceBoard() {
             合格评定与更换提醒
           </Typography.Title>
           <p className="gb-hint">
-            按标定周期（365 天）与脉冲响应结论评定仪器是否合格；超期未标定与不合格仪器高亮提示，可直接登记更换并跟踪到复核闭环。
+            按标定周期（365 天）与脉冲响应结论评定在账仪器；台阵转「运行中」且有投运日期后仪器才进在账，
+            周期自安装日与投运日的较晚者起算——超期名单与按期标定率同一口径，未在账的在对账区单列。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreate()}>
@@ -276,7 +313,14 @@ export default function ReplaceBoard() {
       </div>
 
       <div className="gb-stats-row">
-        <StatBadge label="仪器台数" value={totals.instruments} suffix="台" tone="primary" />
+        <StatBadge label="在账台数" value={totals.instruments} suffix="台" tone="primary" tip="台阵运行中且有投运日期的仪器才进在账" />
+        <StatBadge
+          label="未在账"
+          value={totals.offBook}
+          suffix="台"
+          tone={totals.offBook > 0 ? 'info' : 'success'}
+          tip="台阵建设中 / 停测或缺投运日期，暂不进超期名单与按期标定率"
+        />
         <StatBadge
           label="超期未标定"
           value={totals.overdue}
@@ -289,7 +333,7 @@ export default function ReplaceBoard() {
           suffix="台"
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
         />
-        <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
+        <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" tip="与超期名单同一口径：只统计在账仪器" />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
       </div>
@@ -309,8 +353,86 @@ export default function ReplaceBoard() {
             .join('；')}
         />
       ) : (
-        <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
+        <Alert type="success" showIcon message="全部在账仪器均在标定周期内，无需特别提醒" />
       )}
+
+      <Card
+        className="gb-panel"
+        size="small"
+        title={`在账对账（按台站码）：对上 ${reconcile.matched.length} 站 · 单列 ${reconcile.unmatched.length} 站`}
+        extra={
+          <Button size="small" icon={<ReloadOutlined />} loading={retrying} onClick={() => void handleRetryReconcile()}>
+            重试对账（仅布设班组侧）
+          </Button>
+        }
+      >
+        {reconcile.unmatched.length === 0 ? (
+          <Alert
+            type="success"
+            showIcon
+            message="布设班组侧台站与台网中心侧投运信息全部对上，无单列项"
+          />
+        ) : (
+          <>
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 10 }}
+              message="以下台站对不上，暂不进在账与标定周期；重试只重读布设班组侧台账，台网中心下发的投运日期不回退"
+            />
+            <Table
+              rowKey={(row) => row.station.id}
+              size="small"
+              className="gb-table-compact"
+              dataSource={reconcile.unmatched}
+              pagination={false}
+              columns={[
+                {
+                  title: '台站码',
+                  width: 110,
+                  render: (_: unknown, row) => <span className="gb-mono">{row.station.code}</span>,
+                },
+                {
+                  title: '所属台阵',
+                  width: 180,
+                  render: (_: unknown, row) =>
+                    row.array ? (
+                      <Space size={6}>
+                        <span>{row.array.name}</span>
+                        <Tag color={row.array.state === '运行中' ? 'green' : row.array.state === '建设中' ? 'blue' : 'red'}>
+                          {row.array.state}
+                        </Tag>
+                      </Space>
+                    ) : (
+                      <span className="gb-danger">台阵缺失</span>
+                    ),
+                },
+                {
+                  title: '投运日期',
+                  width: 120,
+                  render: (_: unknown, row) => (
+                    <span className="gb-mono">{row.array?.commissionDate || '未投运'}</span>
+                  ),
+                },
+                {
+                  title: '仪器台数',
+                  width: 90,
+                  align: 'right',
+                  render: (_: unknown, row) => <span className="gb-mono">{row.instrumentCount}</span>,
+                },
+                {
+                  title: '最早安装日期',
+                  width: 120,
+                  render: (_: unknown, row) => (
+                    <span className="gb-mono">{row.earliestInstallDate ?? '—'}</span>
+                  ),
+                },
+                { title: '对不上原因', dataIndex: 'reason', ellipsis: true },
+              ]}
+            />
+          </>
+        )}
+      </Card>
 
       <FilterBar
         modelValue={filterModel}
@@ -333,8 +455,8 @@ export default function ReplaceBoard() {
 
       {rows.length === 0 ? (
         <EmptyPanel
-          title={instruments.length === 0 ? '还没有仪器' : '没有符合条件的仪器'}
-          description="先到「台站仪器」页登记仪器并录入标定结果，再回到本页进行合格评定与更换跟踪。"
+          title={instruments.length === 0 ? '还没有仪器' : '在账范围内没有符合条件的仪器'}
+          description="台阵转「运行中」且有投运日期后仪器才进在账；请先到「台站仪器」页登记仪器并录入标定结果，或检查对账单列。"
           actionText="登记更换"
           secondaryText="重置筛选"
           onAction={() => openCreate()}
@@ -367,6 +489,16 @@ export default function ReplaceBoard() {
                 <div>
                   <div className="gb-mono">{row.stationCode}</div>
                   <div className="gb-hint">{row.arrayName}</div>
+                </div>
+              ),
+            },
+            {
+              title: '周期起算',
+              width: 120,
+              render: (_: unknown, row: AssessmentRow) => (
+                <div>
+                  <div className="gb-mono">{row.cycleBase}</div>
+                  <div className="gb-hint">安装 / 投运取晚</div>
                 </div>
               ),
             },

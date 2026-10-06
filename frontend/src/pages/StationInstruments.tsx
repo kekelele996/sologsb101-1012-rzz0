@@ -60,11 +60,13 @@ import {
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
+import { isArrayOnBook } from '@/types/array';
 import {
   COMMON_MODELS,
   INSTRUMENT_STATES,
   INSTRUMENT_TYPES,
   createEmptyInstrumentDraft,
+  cycleBaseDate,
   daysUntilDue,
   type Instrument,
   type InstrumentState,
@@ -138,50 +140,51 @@ export default function StationInstruments() {
     selectInstrumentsOfStation(state, activeStationId)
   );
 
-  /** 台站行：附带仪器、标定与超期统计 */
-  const rows = useMemo<StationRow[]>(
-    () =>
-      stations
-        .filter((station) => {
-          const keyword = stationFilter.keyword.trim();
-          if (keyword.length > 0 && !`${station.code}${station.bedrock}${station.siteNote}`.includes(keyword)) {
-            return false;
-          }
-          if (stationFilter.bedrocks.length > 0 && !stationFilter.bedrocks.includes(station.bedrock)) return false;
-          if (stationFilter.minElevM !== null && station.elevM < stationFilter.minElevM) return false;
-          const count = allInstruments.filter((instrument) => instrument.stationId === station.id).length;
-          if (stationFilter.onlyEmpty && count > 0) return false;
-          return true;
-        })
-        .map((station) => {
-          const stationInstruments = allInstruments.filter(
-            (instrument) => instrument.stationId === station.id
-          );
-          const instrumentIds = new Set(stationInstruments.map((instrument) => instrument.id));
-          const stationCalibrations = calibrations.filter((calibration) =>
-            instrumentIds.has(calibration.instrumentId)
-          );
-          const unqualified = stationCalibrations.filter(
-            (calibration) => calibration.responseVerdict === '不合格'
-          ).length;
-          const overdue = stationInstruments.filter((instrument) => {
-            const own = calibrations
-              .filter((calibration) => calibration.instrumentId === instrument.id)
-              .sort((a, b) => b.date.localeCompare(a.date));
-            const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
-          }).length;
-          return {
-            station,
-            instruments: stationInstruments,
-            calibrationCount: stationCalibrations.length,
-            unqualified,
-            overdue,
-            worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
-          };
-        }),
-    [allInstruments, calibrations, stationFilter, stations]
-  );
+  /** 台站行：附带仪器、标定与超期统计（超期只在账口径下统计） */
+  const rows = useMemo<StationRow[]>(() => {
+    const onBook = isArrayOnBook(array);
+    return stations
+      .filter((station) => {
+        const keyword = stationFilter.keyword.trim();
+        if (keyword.length > 0 && !`${station.code}${station.bedrock}${station.siteNote}`.includes(keyword)) {
+          return false;
+        }
+        if (stationFilter.bedrocks.length > 0 && !stationFilter.bedrocks.includes(station.bedrock)) return false;
+        if (stationFilter.minElevM !== null && station.elevM < stationFilter.minElevM) return false;
+        const count = allInstruments.filter((instrument) => instrument.stationId === station.id).length;
+        if (stationFilter.onlyEmpty && count > 0) return false;
+        return true;
+      })
+      .map((station) => {
+        const stationInstruments = allInstruments.filter(
+          (instrument) => instrument.stationId === station.id
+        );
+        const instrumentIds = new Set(stationInstruments.map((instrument) => instrument.id));
+        const stationCalibrations = calibrations.filter((calibration) =>
+          instrumentIds.has(calibration.instrumentId)
+        );
+        const unqualified = stationCalibrations.filter(
+          (calibration) => calibration.responseVerdict === '不合格'
+        ).length;
+        const overdue = onBook
+          ? stationInstruments.filter((instrument) => {
+              const own = calibrations
+                .filter((calibration) => calibration.instrumentId === instrument.id)
+                .sort((a, b) => b.date.localeCompare(a.date));
+              const cycleBase = cycleBaseDate(instrument.installDate, array);
+              return daysUntilDue(own.length > 0 ? own[0].date : null, instrument.installDate, cycleBase) < 0;
+            }).length
+          : 0;
+        return {
+          station,
+          instruments: stationInstruments,
+          calibrationCount: stationCalibrations.length,
+          unqualified,
+          overdue,
+          worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
+        };
+      });
+  }, [allInstruments, array, calibrations, stationFilter, stations]);
 
   const totals = useMemo(
     () => ({
@@ -318,12 +321,17 @@ export default function StationInstruments() {
       } else {
         await dispatch(createInstrument(payload)).unwrap();
         dispatch(patchDraft(payload));
-        const dueInDays = daysUntilDue(null, payload.installDate);
-        message.success(
-          dueInDays >= 0
-            ? `仪器已登记，距下次标定 ${dueInDays} 天`
-            : `仪器已登记，安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`
-        );
+        const cycleBase = cycleBaseDate(payload.installDate, array);
+        if (cycleBase === null) {
+          message.success('仪器已登记；台阵尚未投运，暂不进在账与标定周期，投运后自投运日起算');
+        } else {
+          const dueInDays = daysUntilDue(null, payload.installDate, cycleBase);
+          message.success(
+            dueInDays >= 0
+              ? `仪器已登记，距下次标定 ${dueInDays} 天`
+              : `仪器已登记，周期起算日距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`
+          );
+        }
       }
       setInstrumentModalOpen(false);
     } catch (error) {
@@ -383,8 +391,11 @@ export default function StationInstruments() {
             {array.name} · 台站仪器登记
           </Typography.Title>
           <p className="gb-hint">
-            维护台站地理坐标与基岩类型并登记仪器；序列号全局唯一，登记后自动生成下一次标定待办（周期
-            365 天）。
+            维护台站地理坐标与基岩类型并登记仪器；序列号全局唯一。台阵转「运行中」且有投运日期后仪器才进在账，
+            标定周期自安装日与投运日的较晚者起算（365 天）。
+            {isArrayOnBook(array)
+              ? `当前台阵在账（投运 ${array.commissionDate}）。`
+              : '当前台阵未在账：已装仪器暂不进超期名单，投运后自动起算。'}
           </p>
         </div>
         <Space wrap>
@@ -518,8 +529,10 @@ export default function StationInstruments() {
             {
               title: '标定提醒',
               width: 130,
-              render: (_: unknown, row: StationRow) =>
-                row.overdue > 0 ? <Tag color="red">超期 {row.overdue} 台</Tag> : <Tag color="green">按期</Tag>,
+              render: (_: unknown, row: StationRow) => {
+                if (!isArrayOnBook(array)) return <Tag>未投运</Tag>;
+                return row.overdue > 0 ? <Tag color="red">超期 {row.overdue} 台</Tag> : <Tag color="green">按期</Tag>;
+              },
             },
             {
               title: '综合结论',
@@ -637,13 +650,16 @@ export default function StationInstruments() {
                 },
                 {
                   title: '距下次标定',
-                  width: 130,
+                  width: 150,
                   render: (_: unknown, instrument: Instrument) => {
+                    const cycleBase = cycleBaseDate(instrument.installDate, array);
+                    if (cycleBase === null) {
+                      return <span className="gb-hint">未投运，暂不进周期</span>;
+                    }
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));
-                    const last = own.length > 0 ? own[0].date : instrument.installDate;
-                    const days = daysUntilDue(last, instrument.installDate);
+                    const days = daysUntilDue(own.length > 0 ? own[0].date : null, instrument.installDate, cycleBase);
                     return (
                       <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
                         {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}

@@ -7,6 +7,7 @@
  */
 import Dexie, { liveQuery, type Table } from 'dexie';
 import type { SeisArray } from '@/types/array';
+import { deriveCommissionDate } from '@/types/array';
 import type { SeisStation } from '@/types/station';
 import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
@@ -14,7 +15,7 @@ import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -58,7 +59,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -86,6 +87,33 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+      });
+
+    // v3：台阵增加投运日期（台网中心维护），在账与标定周期自投运起算
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, commissionDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 迁移：旧数据没有投运日期，按旗下仪器最早安装日期回填；
+        // 建设中的台阵留空（未投运）；无仪器可参照的补不出、留空，由对账面板单列待台网中心补登。
+        const stations = (await tx.table('stations').toArray()) as SeisStation[];
+        const instruments = (await tx.table('instruments').toArray()) as Instrument[];
+        await tx
+          .table('arrays')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.commissionDate === 'string') return;
+            row.commissionDate = deriveCommissionDate(
+              { id: String(row.id), state: row.state as SeisArray['state'] },
+              stations,
+              instruments
+            );
+          });
       });
   }
 }
@@ -157,13 +185,17 @@ interface SeedArray {
   apertureKm: number;
   deployDate: string;
   state: SeisArray['state'];
+  /** 投运日期（台网中心下发，空串 = 未投运） */
+  commissionDate: string;
   department: string;
   stations: SeedStation[];
 }
 
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
+ * 播种演示数据：3 个台阵 → 7 个台站 → 10 台仪器 → 10 条标定 + 3 条更换，
+ * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本；
+ * 含 1 个建设中的台阵（仪器已预装但未投运，不进在账与超期名单）
+ * 与 1 个投运日晚于安装日的台阵（周期自投运日起算）。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now();
@@ -177,6 +209,8 @@ export async function seedDemoData(): Promise<void> {
       apertureKm: 24.6,
       deployDate: '2021-04-18',
       state: '运行中',
+      // 投运日晚于安装日约 8 个月：建设期预装仪器的标定周期自投运日起算
+      commissionDate: '2021-12-28',
       department: '省地震局监测中心',
       stations: [
         {
@@ -343,6 +377,7 @@ export async function seedDemoData(): Promise<void> {
       apertureKm: 46.2,
       deployDate: '2019-09-25',
       state: '运行中',
+      commissionDate: '2019-09-25',
       department: '国家测震台网中心',
       stations: [
         {
@@ -442,6 +477,64 @@ export async function seedDemoData(): Promise<void> {
                   remark: '自噪接近上限，判定不合格',
                 },
               ],
+            },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'arr_yl',
+      name: '云岭构造监测台阵',
+      apertureKm: 18.4,
+      deployDate: daysAgo(540),
+      state: '建设中',
+      // 台网中心尚未投运：仪器虽已预装，但不进在账台数与标定周期
+      commissionDate: '',
+      department: '省地震局监测中心',
+      stations: [
+        {
+          id: 'stn_yl_01',
+          arrayId: 'arr_yl',
+          code: 'YL01',
+          lat: 27.3412,
+          lng: 100.1625,
+          elevM: 2360,
+          bedrock: '片麻岩',
+          siteNote: '山顶基岩台，待通电联调',
+          instruments: [
+            {
+              id: 'ins_yl01_bb',
+              stationId: 'stn_yl_01',
+              type: '宽频带',
+              model: 'Trillium-Compact',
+              serialNo: 'TC-YL01-PRE-01',
+              installDate: daysAgo(500),
+              state: '在用',
+              remark: '建设期预装，待台网中心投运后进周期',
+              calibrations: [],
+            },
+          ],
+        },
+        {
+          id: 'stn_yl_02',
+          arrayId: 'arr_yl',
+          code: 'YL02',
+          lat: 27.4103,
+          lng: 100.2874,
+          elevM: 2115,
+          bedrock: '砂岩',
+          siteNote: '山腰台，传输链路待验收',
+          instruments: [
+            {
+              id: 'ins_yl02_sm',
+              stationId: 'stn_yl_02',
+              type: '强震',
+              model: 'ETNA2',
+              serialNo: 'ETNA2-YL02-PRE-02',
+              installDate: daysAgo(490),
+              state: '在用',
+              remark: '建设期预装，待台网中心投运后进周期',
+              calibrations: [],
             },
           ],
         },
