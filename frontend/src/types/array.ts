@@ -12,9 +12,15 @@ export interface SeisArray {
   apertureKm: number;
   /** 台站数（由台站表汇总回写） */
   stationCount: number;
-  /** 布设日期 */
+  /** 布设日期（布设班组登记） */
   deployDate: string;
-  /** 运行状态 */
+  /**
+   * 投运日期（台网中心核定，YYYY-MM-DD）。
+   * 台阵转为「运行中」时由台网中心填写；建设中为空。
+   * 标定周期从投运日起算；旧数据缺失时升级按最早安装日期补，补不出的单列待核。
+   */
+  commissionDate?: string;
+  /** 运行状态（台网中心核定） */
   state: ArrayState;
   /** 管理部门 */
   department: string;

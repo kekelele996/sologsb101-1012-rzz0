@@ -163,6 +163,9 @@ export default function App() {
                   <Tag>孔径 {currentArray.apertureKm} km</Tag>
                   <Tag color={currentArray.state === '运行中' ? 'green' : 'orange'}>{currentArray.state}</Tag>
                   <Tag>布设 {currentArray.deployDate}</Tag>
+                  <Tag color={currentArray.state === '运行中' && !currentArray.commissionDate ? 'orange' : 'default'}>
+                    投运 {currentArray.state === '建设中' ? '未投运' : currentArray.commissionDate || '待核定'}
+                  </Tag>
                 </>
               ) : (
                 <Tag>未选择台阵</Tag>

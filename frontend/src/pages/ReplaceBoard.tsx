@@ -52,7 +52,8 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
+import type { Instrument } from '@/types/instrument';
+import { buildInstrumentLedger, type InstrumentLedgerEntry } from '@/utils/reconcile';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
@@ -72,12 +73,48 @@ interface AssessmentRow {
   stationCode: string;
   arrayId: string;
   arrayName: string;
+  arrayState: string;
+  commissionDate: string | null;
   lastDate: string;
-  dueInDays: number;
+  dueInDays: number | null;
+  onLedger: boolean;
   overdue: boolean;
+  unresolved: boolean;
   lastVerdict: string;
   calibrationCount: number;
   replace: Replace | null;
+}
+
+/** 由在账台账条目派生评定行 */
+function toAssessmentRow(
+  entry: InstrumentLedgerEntry,
+  calibrations: Array<{ instrumentId: string; date: string; responseVerdict: string }>,
+  replaces: Replace[]
+): AssessmentRow {
+  const own = calibrations
+    .filter((row) => row.instrumentId === entry.instrument.id)
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const latest = own[0];
+  const replace =
+    replaces
+      .filter((row) => row.instrumentId === entry.instrument.id)
+      .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
+  return {
+    instrument: entry.instrument,
+    stationCode: entry.station?.code ?? '未知台站',
+    arrayId: entry.array?.id ?? '',
+    arrayName: entry.array?.name ?? '未知台阵',
+    arrayState: entry.array?.state ?? '未知',
+    commissionDate: entry.info.commissionDate,
+    lastDate: latest ? latest.date : entry.info.commissionDate ?? entry.instrument.installDate,
+    dueInDays: entry.onLedger ? entry.dueInDays : null,
+    onLedger: entry.onLedger,
+    overdue: entry.overdue,
+    unresolved: entry.unresolved,
+    lastVerdict: latest ? latest.responseVerdict : '待判定',
+    calibrationCount: own.length,
+    replace,
+  };
 }
 
 export default function ReplaceBoard() {
@@ -91,7 +128,7 @@ export default function ReplaceBoard() {
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
   const filter = useAppSelector(selectReplaceFilter);
-  const { histories } = useCalibHistory();
+  const { overdueHistories, unresolvedHistories } = useCalibHistory();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -102,35 +139,11 @@ export default function ReplaceBoard() {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：结合在账口径、标定结论与更换记录 */
   const rows = useMemo<AssessmentRow[]>(() => {
-    return instruments
-      .map((instrument) => {
-        const station = stations.find((row) => row.id === instrument.stationId);
-        const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
-        const own = calibrations
-          .filter((row) => row.instrumentId === instrument.id)
-          .sort((a, b) => b.date.localeCompare(a.date));
-        const latest = own[0];
-        const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
-        const replace =
-          replaces
-            .filter((row) => row.instrumentId === instrument.id)
-            .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
-        return {
-          instrument,
-          stationCode: station?.code ?? '未知台站',
-          arrayId: array?.id ?? '',
-          arrayName: array?.name ?? '未知台阵',
-          lastDate,
-          dueInDays,
-          overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
-          calibrationCount: own.length,
-          replace,
-        };
-      })
+    const { entries } = buildInstrumentLedger(arrays, stations, instruments, calibrations);
+    return entries
+      .map((entry) => toAssessmentRow(entry, calibrations, replaces))
       .filter((row) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
@@ -144,18 +157,38 @@ export default function ReplaceBoard() {
         }
         return true;
       })
-      .sort((a, b) => a.dueInDays - b.dueInDays);
+      .sort((a, b) => (a.dueInDays ?? Number.MAX_SAFE_INTEGER) - (b.dueInDays ?? Number.MAX_SAFE_INTEGER));
   }, [arrays, calibrations, filter, instruments, replaces, stations]);
 
+  /** 在账行（与超期名单、按期标定率同一口径） */
+  const ledgerRows = useMemo(() => rows.filter((row) => row.onLedger), [rows]);
+  /** 待核行：运行中但投运日期缺失，单列 */
+  const unresolvedRows = useMemo(() => rows.filter((row) => row.unresolved), [rows]);
+  /** 未投运行：建设中 / 停测台阵，仪器已安装但不参评 */
+  const offLedgerRows = useMemo(() => rows.filter((row) => !row.onLedger && !row.unresolved), [rows]);
+
   const totals = useMemo(() => {
-    const overdue = rows.filter((row) => row.overdue).length;
-    const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
+    const overdue = ledgerRows.filter((row) => row.overdue).length;
+    const unqualified = ledgerRows.filter((row) => row.lastVerdict === '不合格').length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
+    // 按期标定率：在账未超期 / 在账台数；分母与超期名单完全同口径
     const cycleRate =
-      rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
-  }, [replaces, rows]);
+      ledgerRows.length === 0
+        ? 0
+        : Number((((ledgerRows.length - overdue) / ledgerRows.length) * 100).toFixed(1));
+    return {
+      installed: rows.length,
+      onLedger: ledgerRows.length,
+      overdue,
+      unqualified,
+      pendingReplace,
+      closedReplace,
+      cycleRate,
+      unresolved: unresolvedRows.length,
+      offLedger: offLedgerRows.length,
+    };
+  }, [ledgerRows, offLedgerRows.length, replaces, rows.length, unresolvedRows.length]);
 
   const replaceRows = useMemo(
     () =>
@@ -254,9 +287,6 @@ export default function ReplaceBoard() {
     );
   };
 
-  /** 超期仪器提醒（标定周期 365 天） */
-  const overdueHistories = histories.filter((history) => history.overdue);
-
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div className="gb-brand-bar" />
@@ -267,7 +297,8 @@ export default function ReplaceBoard() {
             合格评定与更换提醒
           </Typography.Title>
           <p className="gb-hint">
-            按标定周期（365 天）与脉冲响应结论评定仪器是否合格；超期未标定与不合格仪器高亮提示，可直接登记更换并跟踪到复核闭环。
+            布设班组管安装位与安装日期，台网中心管台阵状态与投运日期；仅运行中且投运日期齐备的在账仪器按 365
+            天周期（自投运日起算）评定，超期名单与按期标定率同一口径；建设中台阵的仪器单列、不进名单。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreate()}>
@@ -276,7 +307,20 @@ export default function ReplaceBoard() {
       </div>
 
       <div className="gb-stats-row">
-        <StatBadge label="仪器台数" value={totals.instruments} suffix="台" tone="primary" />
+        <StatBadge
+          label="已安装仪器"
+          value={totals.installed}
+          suffix="台"
+          tone="default"
+          tip="含建设中 / 停测台阵已安装的仪器"
+        />
+        <StatBadge
+          label="在账台数"
+          value={totals.onLedger}
+          suffix="台"
+          tone="primary"
+          tip="仅运行中且投运日期齐备的在用 / 待标定仪器；超期名单与按期标定率以此为分母"
+        />
         <StatBadge
           label="超期未标定"
           value={totals.overdue}
@@ -289,7 +333,15 @@ export default function ReplaceBoard() {
           suffix="台"
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
         />
-        <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
+        <StatBadge
+          label="按期标定率"
+          value={totals.cycleRate}
+          percent={totals.cycleRate}
+          tone="success"
+          tip="在账未超期 / 在账台数，与超期名单同一口径（自投运日起算 365 天）"
+        />
+        <StatBadge label="待核投运日" value={totals.unresolved} suffix="台" tone="warning" />
+        <StatBadge label="未投运（建设/停测）" value={totals.offLedger} suffix="台" tone="info" />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
       </div>
@@ -299,18 +351,40 @@ export default function ReplaceBoard() {
           type="warning"
           showIcon
           icon={<WarningFilled />}
-          message={`存在 ${overdueHistories.length} 台超期未标定仪器，请优先安排标定或登记更换`}
-          description={overdueHistories
+          message={`在账仪器中存在 ${overdueHistories.length} 台超期未标定，请优先安排标定或登记更换`}
+          description={
+            <span>
+              {overdueHistories
+                .slice(0, 5)
+                .map(
+                  (history) =>
+                    `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo}）自投运日 ${history.commissionDate ?? '—'} 起已超期 ${Math.abs(history.dueInDays ?? 0)} 天`
+                )
+                .join('；')}
+              {totals.offLedger > 0
+                ? `（另有 ${totals.offLedger} 台仪器随建设中 / 停测台阵已安装但未进在账，不在超期名单内）`
+                : ''}
+            </span>
+          }
+        />
+      ) : (
+        <Alert type="success" showIcon message="在账仪器均在标定周期内，无需特别提醒" />
+      )}
+
+      {unresolvedHistories.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`${unresolvedHistories.length} 台仪器所属运行中台阵缺少投运日期，已单列待核，暂不计入在账与超期名单`}
+          description={unresolvedHistories
             .slice(0, 5)
             .map(
               (history) =>
-                `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo}）已超期 ${Math.abs(history.dueInDays)} 天`
+                `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo}）`
             )
             .join('；')}
         />
-      ) : (
-        <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
-      )}
+      ) : null}
 
       <FilterBar
         modelValue={filterModel}
@@ -346,7 +420,11 @@ export default function ReplaceBoard() {
           className="gb-table-compact"
           dataSource={rows}
           pagination={{ pageSize: 10, showSizeChanger: false }}
-          rowClassName={(row) => (row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : '')}
+          rowClassName={(row) => {
+            if (row.overdue || row.lastVerdict === '不合格') return 'gb-row-danger';
+            if (row.unresolved) return 'gb-row-warning';
+            return '';
+          }}
           columns={[
             {
               title: '仪器',
@@ -362,11 +440,31 @@ export default function ReplaceBoard() {
             },
             {
               title: '台站 / 台阵',
-              width: 180,
+              width: 190,
               render: (_: unknown, row: AssessmentRow) => (
                 <div>
                   <div className="gb-mono">{row.stationCode}</div>
-                  <div className="gb-hint">{row.arrayName}</div>
+                  <div className="gb-hint">
+                    {row.arrayName}
+                    <Tag
+                      style={{ marginInlineStart: 4 }}
+                      color={row.arrayState === '运行中' ? 'green' : row.arrayState === '建设中' ? 'blue' : 'red'}
+                    >
+                      {row.arrayState}
+                    </Tag>
+                  </div>
+                </div>
+              ),
+            },
+            {
+              title: '安装 / 投运',
+              width: 180,
+              render: (_: unknown, row: AssessmentRow) => (
+                <div>
+                  <div className="gb-hint gb-mono">装 {row.instrument.installDate}</div>
+                  <div className="gb-mono">
+                    运 {row.commissionDate ?? <span className="gb-hint">未核定</span>}
+                  </div>
                 </div>
               ),
             },
@@ -375,19 +473,27 @@ export default function ReplaceBoard() {
               width: 130,
               render: (_: unknown, row: AssessmentRow) => (
                 <div>
-                  <div className="gb-mono">{row.lastDate}</div>
+                  <div className="gb-mono">{row.calibrationCount > 0 ? row.lastDate : '—'}</div>
                   <div className="gb-hint">{row.calibrationCount} 次记录</div>
                 </div>
               ),
             },
             {
               title: '标定提醒',
-              width: 160,
-              render: (_: unknown, row: AssessmentRow) => (
-                <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
-                  {row.overdue ? `超期 ${Math.abs(row.dueInDays)} 天` : `剩余 ${row.dueInDays} 天`}
-                </span>
-              ),
+              width: 170,
+              render: (_: unknown, row: AssessmentRow) => {
+                if (row.unresolved) return <Tag color="orange">投运日待核，暂不参评</Tag>;
+                if (!row.onLedger) {
+                  return <Tag color="blue">{row.arrayState === '建设中' ? '建设中不参评' : '非在账不参评'}</Tag>;
+                }
+                return (
+                  <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
+                    {row.overdue
+                      ? `超期 ${Math.abs(row.dueInDays ?? 0)} 天`
+                      : `剩余 ${row.dueInDays ?? 0} 天`}
+                  </span>
+                );
+              },
             },
             {
               title: '标定结论',

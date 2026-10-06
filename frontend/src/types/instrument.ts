@@ -61,16 +61,3 @@ export const COMMON_MODELS: Record<InstrumentType, string[]> = {
   短周期: ['FSS-3B', 'L-4C-3D', 'CDJ-S2C'],
   强震: ['ES-T', 'CMG-5TDE', 'ETNA2', 'GL-P2B']
 };
-
-/**
- * 计算距下次标定的天数：正数表示剩余天数，负数表示已超期天数。
- * 以最近一次标定日期（无标定则用安装日期）为基准。
- */
-export function daysUntilDue(lastCalibrationDate: string | null, installDate: string): number {
-  const base = lastCalibrationDate ?? installDate;
-  const baseTime = Date.parse(`${base}T00:00:00`);
-  if (!Number.isFinite(baseTime)) return CALIBRATION_CYCLE_DAYS;
-  const dueTime = baseTime + CALIBRATION_CYCLE_DAYS * 86400000;
-  const diff = dueTime - Date.now();
-  return Math.round(diff / 86400000);
-}

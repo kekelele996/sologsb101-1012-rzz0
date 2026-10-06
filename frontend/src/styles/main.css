@@ -131,3 +131,12 @@ body::before {
     padding: 12px;
   }
 }
+
+/* 评定表格行：超期 / 不合格红色底，投运日期待核橙色底 */
+.gb-row-danger > td {
+  background: #fdecea !important;
+}
+
+.gb-row-warning > td {
+  background: #fff7e6 !important;
+}

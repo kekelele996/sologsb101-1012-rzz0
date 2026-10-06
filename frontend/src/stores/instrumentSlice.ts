@@ -5,7 +5,8 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { db, createId, watchTable } from '@/utils/db';
 import type { Instrument, InstrumentDraft, InstrumentState, InstrumentType } from '@/types/instrument';
-import { createEmptyInstrumentDraft, daysUntilDue } from '@/types/instrument';
+import { createEmptyInstrumentDraft } from '@/types/instrument';
+import { buildInstrumentLedger } from '@/utils/reconcile';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -54,9 +55,27 @@ export const createInstrument = createAsyncThunk(
     const now = Date.now();
     const row: Instrument = { ...payload, id: createId('ins'), createdAt: now, updatedAt: now };
     await db.instruments.put(row);
-    // 登记后自动生成下一次标定待办：待标定状态 + 提示文案
-    const dueInDays = daysUntilDue(null, row.installDate);
-    return { row, dueInDays };
+    // 登记后按统一在账口径生成下一次标定待办：建设中台阵不进周期；
+    // 运行中缺投运日期的单列待核，不冒进超期名单。
+    const [arrays, stations, instruments, calibrations] = await Promise.all([
+      db.arrays.toArray(),
+      db.stations.toArray(),
+      db.instruments.toArray(),
+      db.calibrations.toArray(),
+    ]);
+    const { entries } = buildInstrumentLedger(arrays, stations, instruments, calibrations, now);
+    const entry = entries.find((item) => item.instrument.id === row.id);
+    let receipt: string;
+    if (!entry?.info.running) {
+      receipt = '仪器已登记：所属台阵仍在建设中，暂不纳入在账台数与标定周期，投运后起算';
+    } else if (entry.unresolved) {
+      receipt = '仪器已登记：台阵投运日期缺失，已单列待核，暂不计入在账与超期名单';
+    } else if (entry.dueInDays >= 0) {
+      receipt = `仪器已登记，标定周期自投运日起算，距下次标定 ${entry.dueInDays} 天`;
+    } else {
+      receipt = `仪器已登记，按投运日起算已超过标定周期 ${Math.abs(entry.dueInDays)} 天，请尽快安排标定`;
+    }
+    return { row, receipt };
   }
 );
 
@@ -148,11 +167,7 @@ const instrumentSlice = createSlice({
   extraReducers: (builder) => {
     builder
       .addCase(createInstrument.fulfilled, (state, action) => {
-        const dueInDays = action.payload.dueInDays;
-        state.lastReceipt =
-          dueInDays >= 0
-            ? `仪器已登记，距下次标定 ${dueInDays} 天，请按期安排标定`
-            : `仪器已登记，但安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`;
+        state.lastReceipt = action.payload.receipt;
         state.error = null;
       })
       .addCase(createInstrument.rejected, (state, action) => {

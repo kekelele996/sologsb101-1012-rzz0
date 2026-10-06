@@ -55,6 +55,7 @@ interface ArrayFormValues {
   name: string;
   apertureKm: number;
   deployDate: dayjs.Dayjs | null;
+  commissionDate: dayjs.Dayjs | null;
   state: ArrayState;
   department: string;
 }
@@ -78,6 +79,7 @@ export default function ArrayList() {
   const [submitting, setSubmitting] = useState(false);
   const [areaBucket, setAreaBucket] = useState(APERTURE_BUCKETS[0].label);
   const [form] = Form.useForm<ArrayFormValues>();
+  const stateWatch = Form.useWatch('state', form) as ArrayState | undefined;
 
   // 首次进入时按 URL query 恢复筛选条件
   useEffect(() => {
@@ -216,6 +218,7 @@ export default function ArrayList() {
       name: '',
       apertureKm: 20,
       deployDate: dayjs(),
+      commissionDate: null,
       state: '建设中',
       department: '',
     });
@@ -228,6 +231,7 @@ export default function ArrayList() {
       name: row.name,
       apertureKm: row.apertureKm,
       deployDate: dayjs(row.deployDate),
+      commissionDate: row.commissionDate ? dayjs(row.commissionDate) : null,
       state: row.state,
       department: row.department,
     });
@@ -236,12 +240,26 @@ export default function ArrayList() {
 
   const submit = async () => {
     const values = await form.validateFields();
+    const deployText = values.deployDate
+      ? values.deployDate.format('YYYY-MM-DD')
+      : dayjs().format('YYYY-MM-DD');
+    // 投运日期由台网中心核定：建设中留空；转为运行中 / 停测时必须填写，且不得早于布设日期
+    const commissionText = values.state === '建设中' ? '' : values.commissionDate?.format('YYYY-MM-DD') ?? '';
+    if (values.state !== '建设中' && !commissionText) {
+      message.warning('台阵转为「运行中 / 停测」前需由台网中心核定投运日期');
+      return;
+    }
+    if (commissionText && commissionText < deployText) {
+      message.warning('投运日期不能早于布设日期');
+      return;
+    }
     setSubmitting(true);
     try {
       const payload = {
         name: values.name.trim(),
         apertureKm: Number(values.apertureKm),
-        deployDate: values.deployDate ? values.deployDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+        deployDate: deployText,
+        commissionDate: commissionText,
         state: values.state,
         department: values.department?.trim() ?? '',
       };
@@ -287,7 +305,8 @@ export default function ArrayList() {
             台阵与台站台账
           </Typography.Title>
           <p className="gb-hint">
-            维护台阵孔径、布设日期与运行状态，台站数与实算孔径自动汇总回显。点击「台站仪器」进入子页面。
+            布设班组维护孔径与布设日期，台网中心核定运行状态与投运日期；台站数与实算孔径自动汇总回显。
+            只有转为运行中（投运日期齐备）的仪器才进在账台数与 365 天标定周期。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
@@ -397,6 +416,14 @@ export default function ArrayList() {
                     <b className="gb-mono">{card.computedApertureKm}</b> km
                   </span>
                   <span>
+                    布设 <b className="gb-mono">{card.row.deployDate}</b>
+                    {card.row.state === '运行中' ? (
+                      <>
+                        {' '}· 投运 <b className="gb-mono">{card.row.commissionDate || '待核定'}</b>
+                      </>
+                    ) : null}
+                  </span>
+                  <span>
                     累计标定 <b className="gb-mono">{card.calibrationCount}</b> 次
                     {card.unqualified > 0 ? (
                       <span className="gb-danger"> · 不合格 {card.unqualified} 次</span>
@@ -452,6 +479,20 @@ export default function ArrayList() {
             { title: '孔径 (km)', dataIndex: 'apertureKm', width: 110, align: 'right', className: 'gb-mono' },
             { title: '台站数', dataIndex: 'stationCount', width: 90, align: 'right', className: 'gb-mono' },
             { title: '布设日期', dataIndex: 'deployDate', width: 120, className: 'gb-mono' },
+            {
+              title: '投运日期',
+              dataIndex: 'commissionDate',
+              width: 120,
+              className: 'gb-mono',
+              render: (value: string | undefined, row: SeisArray) =>
+                row.state === '建设中' ? (
+                  <span className="gb-hint">未投运</span>
+                ) : value ? (
+                  value
+                ) : (
+                  <Tag color="orange">待核定</Tag>
+                ),
+            },
             { title: '管理部门', dataIndex: 'department', ellipsis: true },
             {
               title: '操作',
@@ -505,16 +546,33 @@ export default function ArrayList() {
             <Col span={12}>
               <Form.Item
                 name="deployDate"
-                label="布设日期"
+                label="布设日期（布设班组）"
                 rules={[{ required: true, message: '请选择布设日期' }]}
               >
                 <DatePicker style={{ width: '100%' }} />
               </Form.Item>
             </Col>
           </Row>
-          <Form.Item name="state" label="运行状态" rules={[{ required: true }]}>
-            <Select options={ARRAY_STATES.map((state) => ({ label: state, value: state }))} />
-          </Form.Item>
+          <Row gutter={12}>
+            <Col span={12}>
+              <Form.Item name="state" label="运行状态（台网中心核定）" rules={[{ required: true }]}>
+                <Select options={ARRAY_STATES.map((state) => ({ label: state, value: state }))} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item
+                name="commissionDate"
+                label="投运日期（台网中心核定）"
+                extra={stateWatch === '建设中' ? '建设中：仪器已安装但不进在账与标定周期' : undefined}
+              >
+                <DatePicker
+                  style={{ width: '100%' }}
+                  disabled={stateWatch === '建设中'}
+                  placeholder={stateWatch === '建设中' ? '转运行中后填写' : '选择投运日期'}
+                />
+              </Form.Item>
+            </Col>
+          </Row>
           <Form.Item name="department" label="管理部门">
             <Input placeholder="如：省地震局监测中心" maxLength={40} />
           </Form.Item>

@@ -151,6 +151,50 @@ export const syncStationCount = createAsyncThunk(
   }
 );
 
+/**
+ * 采用台网中心侧对账结果：按台站码把台网中心核定的「台阵状态 + 投运日期」落到台阵档案。
+ * 仅当台网中心给出合法值时覆盖；投运日期一旦核定不回退（空值不清空已有的合法投运日）。
+ * 对账失败只重试布设班组侧，本动作代表台网中心侧的权威写入，重试时也不回滚。
+ */
+export const applyNetworkReconcile = createAsyncThunk(
+  'array/applyNetworkReconcile',
+  async (payload: { records: Array<{ code: string; arrayState?: SeisArray['state']; commissionDate?: string }> }) => {
+    const now = Date.now();
+    const stations = await db.stations.toArray();
+    const stationByKey = new Map(
+      stations.map((station) => [station.code.trim().toUpperCase(), station])
+    );
+    const arrayUpdates = new Map<string, { state?: SeisArray['state']; commissionDate?: string }>();
+    let applied = 0;
+
+    payload.records.forEach((record) => {
+      const station = stationByKey.get(record.code.trim().toUpperCase());
+      if (!station) return; // 对不上的不处理（单列为 networkOnly）
+      const patch: { state?: SeisArray['state']; commissionDate?: string } = {};
+      if (record.arrayState) patch.state = record.arrayState;
+      if (record.commissionDate && /^\d{4}-\d{2}-\d{2}$/.test(record.commissionDate)) {
+        patch.commissionDate = record.commissionDate;
+      }
+      if (Object.keys(patch).length === 0) return;
+      const merged = { ...(arrayUpdates.get(station.arrayId) ?? {}), ...patch };
+      arrayUpdates.set(station.arrayId, merged);
+      applied += 1;
+    });
+
+    await Promise.all(
+      Array.from(arrayUpdates.entries()).map(async ([arrayId, patch]) => {
+        // 台网中心核定写入；本动作只接收合法投运日期，空 / 非法值不到这里，故既有投运日永不回退
+        const next: Partial<SeisArray> = { updatedAt: now };
+        if (patch.state) next.state = patch.state;
+        if (patch.commissionDate) next.commissionDate = patch.commissionDate;
+        await db.arrays.update(arrayId, next as never);
+      })
+    );
+
+    return { applied, arrayCount: arrayUpdates.size };
+  }
+);
+
 const arraySlice = createSlice({
   name: 'array',
   initialState,

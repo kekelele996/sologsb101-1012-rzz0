@@ -65,11 +65,11 @@ import {
   INSTRUMENT_STATES,
   INSTRUMENT_TYPES,
   createEmptyInstrumentDraft,
-  daysUntilDue,
   type Instrument,
   type InstrumentState,
   type InstrumentType,
 } from '@/types/instrument';
+import { buildInstrumentLedger } from '@/utils/reconcile';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -138,6 +138,12 @@ export default function StationInstruments() {
     selectInstrumentsOfStation(state, activeStationId)
   );
 
+  /** 在账口径：建设中台阵的仪器不进周期；运行中缺投运日单列待核 */
+  const ledgerByInstrument = useMemo(() => {
+    const { entries } = buildInstrumentLedger(arrays, stations, allInstruments, calibrations);
+    return new Map(entries.map((entry) => [entry.instrument.id, entry]));
+  }, [allInstruments, arrays, calibrations, stations]);
+
   /** 台站行：附带仪器、标定与超期统计 */
   const rows = useMemo<StationRow[]>(
     () =>
@@ -165,11 +171,7 @@ export default function StationInstruments() {
             (calibration) => calibration.responseVerdict === '不合格'
           ).length;
           const overdue = stationInstruments.filter((instrument) => {
-            const own = calibrations
-              .filter((calibration) => calibration.instrumentId === instrument.id)
-              .sort((a, b) => b.date.localeCompare(a.date));
-            const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
+            return ledgerByInstrument.get(instrument.id)?.overdue ?? false;
           }).length;
           return {
             station,
@@ -180,7 +182,7 @@ export default function StationInstruments() {
             worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
           };
         }),
-    [allInstruments, calibrations, stationFilter, stations]
+    [allInstruments, calibrations, ledgerByInstrument, stationFilter, stations]
   );
 
   const totals = useMemo(
@@ -316,14 +318,8 @@ export default function StationInstruments() {
         await dispatch(updateInstrument({ id: editingInstrumentId, patch: payload })).unwrap();
         message.success('仪器信息已更新');
       } else {
-        await dispatch(createInstrument(payload)).unwrap();
-        dispatch(patchDraft(payload));
-        const dueInDays = daysUntilDue(null, payload.installDate);
-        message.success(
-          dueInDays >= 0
-            ? `仪器已登记，距下次标定 ${dueInDays} 天`
-            : `仪器已登记，安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`
-        );
+        const created = await dispatch(createInstrument(payload)).unwrap();
+        message.success(created.receipt);
       }
       setInstrumentModalOpen(false);
     } catch (error) {
@@ -639,14 +635,17 @@ export default function StationInstruments() {
                   title: '距下次标定',
                   width: 130,
                   render: (_: unknown, instrument: Instrument) => {
-                    const own = calibrations
-                      .filter((row) => row.instrumentId === instrument.id)
-                      .sort((a, b) => b.date.localeCompare(a.date));
-                    const last = own.length > 0 ? own[0].date : instrument.installDate;
-                    const days = daysUntilDue(last, instrument.installDate);
+                    const entry = ledgerByInstrument.get(instrument.id);
+                    if (!entry) return <span className="gb-hint">—</span>;
+                    if (entry.unresolved) {
+                      return <Tag color="orange">投运日待核</Tag>;
+                    }
+                    if (!entry.onLedger) {
+                      return <Tag>{entry.info.running ? '已停用' : '建设中未参评'}</Tag>;
+                    }
                     return (
-                      <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
-                        {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
+                      <span className={entry.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
+                        {entry.overdue ? `超期 ${Math.abs(entry.dueInDays)} 天` : `剩余 ${entry.dueInDays} 天`}
                       </span>
                     );
                   },
